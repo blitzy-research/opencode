@@ -300,7 +300,9 @@ const thinkingConfig = (request: LLMRequest) => {
 }
 
 const fromRequest = Effect.fn("Gemini.fromRequest")(function* (request: LLMRequest) {
-  const toolsEnabled = request.tools.length > 0 && request.toolChoice?.type !== "none"
+  // Tool definitions stay in the request even with toolChoice "none"
+  // (functionCallingConfig mode NONE), preserving the cached prompt prefix.
+  const toolsEnabled = request.tools.length > 0
   const generation = request.generation
   const toolSchemaCompatibility = request.model.compatibility?.toolSchema
   const generationConfig = {

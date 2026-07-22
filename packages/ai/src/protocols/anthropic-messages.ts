@@ -145,7 +145,7 @@ const AnthropicTool = Schema.Struct({
 type AnthropicTool = Schema.Schema.Type<typeof AnthropicTool>
 
 const AnthropicToolChoice = Schema.Union([
-  Schema.Struct({ type: Schema.Literals(["auto", "any"]) }),
+  Schema.Struct({ type: Schema.Literals(["auto", "any", "none"]) }),
   Schema.Struct({ type: Schema.tag("tool"), name: Schema.String }),
 ])
 
@@ -283,7 +283,9 @@ const lowerTool = (breakpoints: Cache.Breakpoints, tool: ToolDefinition, inputSc
 const lowerToolChoice = (toolChoice: NonNullable<LLMRequest["toolChoice"]>) =>
   ProviderShared.matchToolChoice("Anthropic Messages", toolChoice, {
     auto: () => ({ type: "auto" as const }),
-    none: () => undefined,
+    // Native "none" keeps tool definitions in the request, preserving the
+    // cached prompt prefix on the final Step.
+    none: () => ({ type: "none" as const }),
     required: () => ({ type: "any" as const }),
     tool: (name) => ({ type: "tool" as const, name }),
   })
@@ -547,7 +549,7 @@ const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (reques
   // over-mark we keep their tool hints and shed the message-tail ones first.
   const breakpoints = Cache.newBreakpoints(ANTHROPIC_BREAKPOINT_CAP)
   const tools =
-    request.tools.length === 0 || request.toolChoice?.type === "none"
+    request.tools.length === 0
       ? undefined
       : request.tools.map((tool) =>
           lowerTool(

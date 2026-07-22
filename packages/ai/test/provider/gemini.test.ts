@@ -214,7 +214,7 @@ describe("Gemini route", () => {
     }),
   )
 
-  it.effect("omits tools when tool choice is none", () =>
+  it.effect("keeps tool definitions with native mode NONE when tool choice is none", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(
         LLM.request({
@@ -226,8 +226,12 @@ describe("Gemini route", () => {
         }),
       )
 
-      expect(prepared.body).toEqual({
+      // Definitions stay in the request so the cached prompt prefix survives
+      // the final Step; NONE forbids calling them.
+      expect(prepared.body).toMatchObject({
         contents: [{ role: "user", parts: [{ text: "Say hello." }] }],
+        tools: [{ functionDeclarations: [expect.objectContaining({ name: "lookup" })] }],
+        toolConfig: { functionCallingConfig: { mode: "NONE" } },
       })
     }),
   )
