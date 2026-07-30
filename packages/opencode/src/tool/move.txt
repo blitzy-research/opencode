@@ -1,0 +1,11 @@
+Moves or renames a file or directory on the local filesystem.
+
+Usage:
+- The source and the destination can each be an absolute path or a path relative to the project directory.
+- One call moves a single file, or a single directory together with all of its contents.
+- Missing parent directories of the destination are created automatically.
+- The call fails if the destination already exists, unless you pass `overwrite: true`, which replaces the destination even when it is a directory that still has contents.
+- The source must exist, and it must resolve to a different path than the destination.
+- Prefer this tool over running `mv` through the bash tool, because it requests targeted `edit` permission for the destination and notifies the editor and the language server of the relocation.
+- Only one entry can be moved per call. Globs and wildcards are not supported, so make a separate call for each file or directory you need to move.
+- A symbolic link is moved as the link itself, not as the file or directory it points to.
