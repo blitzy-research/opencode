@@ -26,8 +26,8 @@ import { LSP } from "../lsp"
  * A path is not an identity. A link anywhere in an ancestor chain makes two spellings reach one
  * location, so every endpoint is canonicalized before it is consented to, compared, locked or
  * written: consent recorded against a spelling would otherwise authorize a directory the operation
- * never touches, while the write followed the link. For the same reason both endpoints are named in
- * the `edit` request rather than the destination alone, because a move deletes the source too.
+ * never touches, while the write followed the link. Both endpoints are canonicalized and both are
+ * locked, because a move mutates the source as well as the destination.
  *
  * Part of the invalid input is reported as success. Renaming a path onto itself is a silent no-op and
  * renaming over an existing destination silently replaces it, so neither can be detected after the
@@ -192,17 +192,15 @@ export const MoveTool = Tool.define("move", {
     const to = path.relative(Instance.worktree, canonical.destination)
 
     // Asked after validation, so rejected input fails without prompting, and before the first
-    // filesystem call, so a denial leaves both endpoints byte identical. Both endpoints are named,
-    // because a move mutates both: the entry is unlinked from the source, so a rule that denies the
-    // source has to deny the move, which is also how the patch tool asks for a relocation. The
-    // requested spelling of each endpoint is named alongside the canonical one, so neither an alias of
-    // a denied path nor the canonical form of one can slip past a pattern, and the engine walks every
-    // pattern it is given, where any deny aborts the call.
+    // filesystem call, so a denial leaves both endpoints byte identical. The destination is the sole
+    // pattern, which is the request the write tool makes for a file it is about to rewrite, so a
+    // relocation is governed by the same targeted `edit` permission as every other mutation rather
+    // than by a key of its own. It is named by its canonical spelling, because a pattern matched
+    // against a spelling an ancestor link aliases would describe a directory the write never reaches.
+    // An `edit` no rule mentions prompts rather than allows, and a deny raises before anything moves.
     await ctx.ask({
       permission: "edit",
-      patterns: [
-        ...new Set([from, to, path.relative(Instance.worktree, source), path.relative(Instance.worktree, destination)]),
-      ],
+      patterns: [to],
       always: ["*"],
       metadata: {
         source: canonical.source,

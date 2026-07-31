@@ -6,6 +6,6 @@ Usage:
 - Missing parent directories of the destination are created automatically.
 - The call fails if the destination already exists, unless you pass `overwrite: true`, which replaces the destination even when it is a directory that still has contents.
 - The source must exist, and it must resolve to a different entry than the destination, with neither path nested inside the other. Neither path may be empty or the project directory itself.
-- Prefer this tool over running `mv` through the bash tool, because it requests targeted `edit` permission for both the source and the destination and notifies the editor and the language server of the relocation.
+- Prefer this tool over running `mv` through the bash tool because it requests targeted `edit` permission for the destination and notifies the editor. File moves also notify the language server.
 - Only one entry can be moved per call. Globs and wildcards are not supported, so make a separate call for each file or directory you need to move.
 - A symbolic link is moved as the link itself, not as the file or directory it points to, and a link at the destination counts as an existing destination even when its target is missing.
