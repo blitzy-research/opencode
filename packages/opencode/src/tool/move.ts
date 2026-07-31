@@ -15,18 +15,23 @@ import { LSP } from "../lsp"
 export const MoveTool = Tool.define("move", {
   description: DESCRIPTION,
   parameters: z.object({
-    source: z.string().min(1).describe("The file or directory to move, as an absolute or project relative path"),
-    destination: z.string().min(1).describe("The path to move it to, as an absolute or project relative path"),
+    // One named entry moves per call, so the two characters the permission matcher treats as wildcards belong in
+    // neither path. Refusing them in the schema keeps a caller from smuggling one into the `<parent>/*` glob the
+    // boundary guard stores on an "always" reply, where it would widen the approval to every sibling the pattern
+    // happens to match, and keeps that refusal ahead of resolution rather than inside it.
+    source: z
+      .string()
+      .min(1)
+      .refine((value) => !/[*?]/.test(value), "Source must not contain * or ?")
+      .describe("The file or directory to move, as an absolute or project relative path, without * or ?"),
+    destination: z
+      .string()
+      .min(1)
+      .refine((value) => !/[*?]/.test(value), "Destination must not contain * or ?")
+      .describe("The path to move it to, as an absolute or project relative path, without * or ?"),
     overwrite: z.boolean().optional().describe("Replace the destination if it already exists (defaults to false)"),
   }),
   async execute(params, ctx) {
-    // One named entry moves per call, so the two characters the permission matcher treats as wildcards belong
-    // in neither path. Refusing them before the boundary guard also keeps a caller from smuggling one into the
-    // `<parent>/*` glob that guard stores on an "always" reply, where it would widen the approval to every
-    // sibling directory the pattern happens to match.
-    if (/[*?]/.test(params.source)) throw new Error(`Source must not contain * or ?: ${params.source}`)
-    if (/[*?]/.test(params.destination)) throw new Error(`Destination must not contain * or ?: ${params.destination}`)
-
     // Resolved with the write tool's rule, then normalized, so `a/./b`, `a/x/../b` and `b/` cannot name one
     // entry while comparing, locking and rendering as two. Only a relative input is joined, and only an
     // already absolute result is normalized.
@@ -53,8 +58,18 @@ export const MoveTool = Tool.define("move", {
     if (destination === path.resolve(Instance.directory) || destination === path.resolve(Instance.worktree))
       throw new Error(`Destination must not be the project root: ${destination}`)
     // Nesting either way is refused before consent, because clearing an overlapping destination would delete
-    // the source, or part of its subtree, before the rename could ever run.
-    if (Filesystem.overlaps(source, destination))
+    // the source, or part of its subtree, before the rename could ever run. Containment is decided per segment
+    // and per root rather than through `Filesystem.overlaps`, which only inspects the first two characters of
+    // the relative path: it reads a real descendant named `..cache` as being outside, and two Windows drive
+    // roots as nested. An absolute relative path means the two roots are disjoint, and every other value
+    // stays inside its base unless a leading `..` segment walks back out.
+    const rel = path.relative(source, destination)
+    const inverse = path.relative(destination, source)
+    const walk = `..${path.sep}`
+    if (
+      (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(walk)) ||
+      (!path.isAbsolute(inverse) && inverse !== ".." && !inverse.startsWith(walk))
+    )
       throw new Error(`Source and destination overlap: one of ${source} and ${destination} contains the other`)
     // Use the stat based Filesystem helpers: Bun's file exists() check reports false for a real directory.
     if (!(await Filesystem.exists(source))) throw new Error(`File or directory not found: ${source}`)
