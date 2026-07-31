@@ -15,10 +15,7 @@ import { LSP } from "../lsp"
 export const MoveTool = Tool.define("move", {
   description: DESCRIPTION,
   parameters: z.object({
-    // One named entry moves per call, so the two characters the permission matcher treats as wildcards belong in
-    // neither path. Refusing them in the schema keeps a caller from smuggling one into the `<parent>/*` glob the
-    // boundary guard stores on an "always" reply, where it would widen the approval to every sibling the pattern
-    // happens to match, and keeps that refusal ahead of resolution rather than inside it.
+    // Reject permission wildcards in the schema so user input cannot broaden an external-directory "always" grant.
     source: z
       .string()
       .min(1)
@@ -32,9 +29,7 @@ export const MoveTool = Tool.define("move", {
     overwrite: z.boolean().optional().describe("Replace the destination if it already exists (defaults to false)"),
   }),
   async execute(params, ctx) {
-    // Resolved with the write tool's rule, then normalized, so `a/./b`, `a/x/../b` and `b/` cannot name one
-    // entry while comparing, locking and rendering as two. Only a relative input is joined, and only an
-    // already absolute result is normalized.
+    // Normalize resolved paths so equivalent spellings share equality checks and lock identities.
     const source = path.resolve(
       path.isAbsolute(params.source) ? params.source : path.join(Instance.directory, params.source),
     )
@@ -49,20 +44,13 @@ export const MoveTool = Tool.define("move", {
     // Renaming a path onto itself succeeds as a silent no-op, so an equal pair is refused here or not at
     // all.
     if (source === destination) throw new Error(`Source and destination are the same path: ${source}`)
-    // `.`, a bare separator and the project path spelled out in full all resolve to the root, which is not a
-    // relocatable entry: an authorized overwrite would recursively remove the whole project. Both project
-    // paths are resolved as well, because a directory handed over as `/project/` or `/project/.` compares
-    // unequal to the very root it names, and a non-git project has no worktree to catch that for it.
+    // Reject normalized project/worktree roots because overwrite could recursively remove the protected root.
     if (source === path.resolve(Instance.directory) || source === path.resolve(Instance.worktree))
       throw new Error(`Source must not be the project root: ${source}`)
     if (destination === path.resolve(Instance.directory) || destination === path.resolve(Instance.worktree))
       throw new Error(`Destination must not be the project root: ${destination}`)
-    // Nesting either way is refused before consent, because clearing an overlapping destination would delete
-    // the source, or part of its subtree, before the rename could ever run. Containment is decided per segment
-    // and per root rather than through `Filesystem.overlaps`, which only inspects the first two characters of
-    // the relative path: it reads a real descendant named `..cache` as being outside, and two Windows drive
-    // roots as nested. An absolute relative path means the two roots are disjoint, and every other value
-    // stays inside its base unless a leading `..` segment walks back out.
+    // Reject ancestor/descendant pairs before consent. A contained relative path stays on the same root and
+    // does not begin with a complete ".." segment.
     const rel = path.relative(source, destination)
     const inverse = path.relative(destination, source)
     const walk = `..${path.sep}`
@@ -106,10 +94,8 @@ export const MoveTool = Tool.define("move", {
         const directory = await Filesystem.isDir(source)
 
         await fs.mkdir(path.dirname(destination), { recursive: true })
-        // Clearing an authorized overwrite target first is what allows a directory to replace a directory
-        // that still has contents, and it stops stale content from surviving underneath the move. Only a
-        // directory on either side needs it, because a rename replaces a file destination in place, so a
-        // file is never destroyed ahead of a relocation that could still fail.
+        // Pre-remove the target when either endpoint is a directory; file-to-file rename replaces in place
+        // without an early destructive step.
         if (overwritten && params.overwrite && (directory || (await Filesystem.isDir(destination))))
           await fs.rm(destination, { recursive: true, force: true })
         // A rename carries a whole directory subtree atomically on one device, and a symbolic link travels
