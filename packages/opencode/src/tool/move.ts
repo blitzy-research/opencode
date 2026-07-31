@@ -12,6 +12,17 @@ import { Filesystem } from "../util/filesystem"
 import { Instance } from "../project/instance"
 import { LSP } from "../lsp"
 
+// A symbolic link is a filesystem entry of its own, and rename relocates the link rather than what it points
+// at. The stat based Filesystem helpers follow the link instead, so on their own they read a dangling link as
+// missing and a link to a directory as a directory. An lstat settles both questions about the entry itself.
+const symlink = (target: string) =>
+  fs
+    .lstat(target)
+    .then((stat) => stat.isSymbolicLink())
+    .catch(() => false)
+const entry = async (target: string) => (await symlink(target)) || (await Filesystem.exists(target))
+const folder = async (target: string) => !(await symlink(target)) && (await Filesystem.isDir(target))
+
 export const MoveTool = Tool.define("move", {
   description: DESCRIPTION,
   parameters: z.object({
@@ -59,10 +70,10 @@ export const MoveTool = Tool.define("move", {
       (!path.isAbsolute(inverse) && inverse !== ".." && !inverse.startsWith(walk))
     )
       throw new Error(`Source and destination overlap: one of ${source} and ${destination} contains the other`)
-    // Use the stat based Filesystem helpers: Bun's file exists() check reports false for a real directory.
-    if (!(await Filesystem.exists(source))) throw new Error(`File or directory not found: ${source}`)
+    // Probe entries rather than open files: Bun's file exists() check reports false for a real directory.
+    if (!(await entry(source))) throw new Error(`File or directory not found: ${source}`)
     // fs.rename can replace an existing destination silently, so enforce the explicit overwrite contract first.
-    if ((await Filesystem.exists(destination)) && !params.overwrite)
+    if ((await entry(destination)) && !params.overwrite)
       throw new Error(`Destination already exists: ${destination}. Pass overwrite: true to replace it`)
 
     const from = path.relative(Instance.worktree, source)
@@ -80,57 +91,54 @@ export const MoveTool = Tool.define("move", {
     })
 
     // Serialized on the destination, as the file time module prescribes for every tool that overwrites an
-    // existing file, and on the source too because a move mutates both. Sorted, so two concurrent moves can
-    // never hold one lock each while waiting for the other; the keys differ because equality was refused.
-    const locks = [source, destination].sort()
-    return FileTime.withLock(locks[0], () =>
-      FileTime.withLock(locks[1], async () => {
-        // Every probe above ran before a permission request that can block for an unbounded time, so the
-        // state deciding what is destroyed and what is reported is read again now that both locks are held.
-        if (!(await Filesystem.exists(source))) throw new Error(`File or directory not found: ${source}`)
-        const overwritten = await Filesystem.exists(destination)
-        if (overwritten && !params.overwrite)
-          throw new Error(`Destination already exists: ${destination}. Pass overwrite: true to replace it`)
-        const directory = await Filesystem.isDir(source)
+    // existing file.
+    return FileTime.withLock(destination, async () => {
+      // Every probe above ran before a permission request that can block for an unbounded time, so the
+      // state deciding what is destroyed and what is reported is read again now that the lock is held.
+      if (!(await entry(source))) throw new Error(`File or directory not found: ${source}`)
+      const overwritten = await entry(destination)
+      if (overwritten && !params.overwrite)
+        throw new Error(`Destination already exists: ${destination}. Pass overwrite: true to replace it`)
+      const directory = await folder(source)
 
-        await fs.mkdir(path.dirname(destination), { recursive: true })
-        // Pre-remove the target when either endpoint is a directory; file-to-file rename replaces in place
-        // without an early destructive step.
-        if (overwritten && params.overwrite && (directory || (await Filesystem.isDir(destination))))
-          await fs.rm(destination, { recursive: true, force: true })
-        // A rename carries a whole directory subtree atomically on one device, and a symbolic link travels
-        // as the link itself rather than as its target, matching `mv`. Across a device boundary it fails
-        // with EXDEV, where a recursive copy followed by removing the source is the equivalent.
-        await fs.rename(source, destination).catch(async (err: NodeJS.ErrnoException) => {
-          if (err.code !== "EXDEV") throw err
-          await fs
-            .cp(source, destination, { recursive: true })
-            .then(() => fs.rm(source, { recursive: true, force: true }))
-        })
+      await fs.mkdir(path.dirname(destination), { recursive: true })
+      // Pre-remove the target when either endpoint is a directory; file-to-file rename replaces in place
+      // without an early destructive step, and rename replaces a link destination the same way.
+      if (overwritten && params.overwrite && (directory || (await folder(destination))))
+        await fs.rm(destination, { recursive: true, force: true })
+      // A rename carries a whole directory subtree atomically on one device, and a symbolic link travels
+      // as the link itself rather than as its target, matching `mv`. Across a device boundary it fails
+      // with EXDEV, where a copy that keeps every link verbatim, followed by removing the source once that
+      // copy has succeeded, is the equivalent.
+      await fs.rename(source, destination).catch(async (err: NodeJS.ErrnoException) => {
+        if (err.code !== "EXDEV") throw err
+        await fs
+          .cp(source, destination, { recursive: true, dereference: false, verbatimSymlinks: true })
+          .then(() => fs.rm(source, { recursive: true, force: true }))
+      })
 
-        // Editors learn that the content is now authoritative at the destination, then that the source
-        // path is gone and the destination path is new. This reuses the existing event triple rather than
-        // introducing a relocation event of its own.
-        await Bus.publish(File.Event.Edited, { file: destination })
-        await Bus.publish(FileWatcher.Event.Updated, { file: source, event: "unlink" })
-        await Bus.publish(FileWatcher.Event.Updated, { file: destination, event: "add" })
+      // Editors learn that the content is now authoritative at the destination, then that the source
+      // path is gone and the destination path is new. This reuses the existing event triple rather than
+      // introducing a relocation event of its own.
+      await Bus.publish(File.Event.Edited, { file: destination })
+      await Bus.publish(FileWatcher.Event.Updated, { file: source, event: "unlink" })
+      await Bus.publish(FileWatcher.Event.Updated, { file: destination, event: "add" })
 
-        // Mark the destination as read for later edits. Only files are touched in the LSP, where
-        // diagnostics are awaited but intentionally not appended to the move result.
-        FileTime.read(ctx.sessionID, destination)
-        if (!directory) await LSP.touchFile(destination, true)
+      // Mark the destination as read for later edits. Only files are touched in the LSP, where
+      // diagnostics are awaited but intentionally not appended to the move result.
+      FileTime.read(ctx.sessionID, destination)
+      if (!directory) await LSP.touchFile(destination, true)
 
-        return {
-          title: `${from} -> ${to}`,
-          metadata: {
-            source,
-            destination,
-            directory,
-            overwritten,
-          },
-          output: directory ? `Moved directory ${from} to ${to}` : `Moved file ${from} to ${to}`,
-        }
-      }),
-    )
+      return {
+        title: `${from} -> ${to}`,
+        metadata: {
+          source,
+          destination,
+          directory,
+          overwritten,
+        },
+        output: directory ? `Moved directory ${from} to ${to}` : `Moved file ${from} to ${to}`,
+      }
+    })
   },
 })
