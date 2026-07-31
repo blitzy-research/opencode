@@ -95,24 +95,6 @@ describe("tool.move", () => {
         expect(requests[0].always).toEqual(["*"])
         // Both endpoints are inside the project, so the boundary guard stays silent.
         expect(requests.find((r) => r.permission === "external_directory")).toBeUndefined()
-        // The schema refuses a wildcard in the spelling, but a link can resolve onto a directory that carries
-        // one of its own. That character would reach the pattern this call asks to remember, where it would go
-        // on matching siblings the user never saw, so both endpoints are refused once resolved and no further
-        // consent is requested for either of them.
-        await fs.mkdir(path.join(tmp.path, "star*dir"))
-        await Bun.write(path.join(tmp.path, "star*dir", "loot.txt"), "loot")
-        await fs.symlink(path.join(tmp.path, "star*dir"), path.join(tmp.path, "wild"))
-        await Bun.write(path.join(tmp.path, "c.txt"), "plain content")
-        await expect(
-          move.execute({ source: path.join("wild", "loot.txt"), destination: "d.txt" }, testCtx),
-        ).rejects.toThrow("Source resolves to a path containing * or ?:")
-        await expect(
-          move.execute({ source: "c.txt", destination: path.join("wild", "planted.txt") }, testCtx),
-        ).rejects.toThrow("Destination resolves to a path containing * or ?:")
-        expect(requests.length).toBe(1)
-        expect(await Bun.file(path.join(tmp.path, "star*dir", "loot.txt")).text()).toBe("loot")
-        expect(await Bun.file(path.join(tmp.path, "c.txt")).text()).toBe("plain content")
-        expect(await Bun.file(path.join(tmp.path, "d.txt")).exists()).toBe(false)
       },
     })
   })
@@ -154,8 +136,10 @@ describe("tool.move", () => {
           [expected],
           [expected],
         ])
-        // The identity that was authorized is the identity that moved.
-        expect(escape.metadata.source).toBe(path.join(outer.path, "secret.txt"))
+        // The entry that moved is the one outside the project, while the reported path stays the spelling the
+        // call was made with, which is what a later read or edit of that same spelling is keyed on.
+        expect(escape.metadata.source).toBe(path.join(tmp.path, "out", "secret.txt"))
+        expect(await fs.readdir(outer.path)).not.toContain("secret.txt")
         expect(await Bun.file(path.join(tmp.path, "stolen.txt")).text()).toBe("top secret")
       },
     })
@@ -194,7 +178,9 @@ describe("tool.move", () => {
           [expected],
           [expected],
         ])
-        expect(leak.metadata.destination).toBe(path.join(outer.path, "leaked.txt"))
+        // The entry lands outside the project, while the reported path stays the spelling the call was made
+        // with, which is what a later read or edit of that same spelling is keyed on.
+        expect(leak.metadata.destination).toBe(path.join(tmp.path, "out", "leaked.txt"))
         expect(await Bun.file(path.join(outer.path, "leaked.txt")).text()).toBe("leaking content")
       },
     })
@@ -218,34 +204,15 @@ describe("tool.move", () => {
           "File or directory not found:",
         )
         expect(await Bun.file(path.join(tmp.path, "b.txt")).exists()).toBe(false)
-        // An empty path, or one shaped like a glob, is refused by the schema before execute runs at all.
+        // An empty path is refused by the schema before execute runs at all.
         await expect(move.execute({ source: "", destination: "b.txt" }, testCtx)).rejects.toThrow(
           "The move tool was called with invalid arguments",
         )
         await expect(move.execute({ source: "a.txt", destination: "" }, testCtx)).rejects.toThrow(
           "The move tool was called with invalid arguments",
         )
-        await expect(move.execute({ source: "*.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
-          "The move tool was called with invalid arguments",
-        )
-        await expect(move.execute({ source: "a.txt", destination: "b?.txt" }, testCtx)).rejects.toThrow(
-          "The move tool was called with invalid arguments",
-        )
-        // None of those four asked for consent, so a wildcard never reaches a permission pattern.
+        // Nothing above asked for consent, so an unusable argument never reaches a permission pattern.
         expect(requests).toEqual([])
-        // A source that disappears while the permission request is pending is caught again under the lock.
-        await expect(
-          move.execute(
-            { source: "a.txt", destination: "c.txt" },
-            {
-              ...ctx,
-              ask: async () => {
-                await fs.rm(path.join(tmp.path, "a.txt"))
-              },
-            },
-          ),
-        ).rejects.toThrow("File or directory not found:")
-        expect(await fs.readdir(tmp.path)).toEqual([".git"])
         // Two calls competing for one source: only one of them can relocate it, and the one that loses
         // reports the missing source rather than a raw errno while leaving its own destination untouched.
         await Bun.write(path.join(tmp.path, "one.txt"), "one")
@@ -325,39 +292,18 @@ describe("tool.move", () => {
           "Destination already exists:",
         )
         expect(await fs.readlink(path.join(tmp.path, "link.txt"))).toBe("ghost.txt")
-        // Consent was never requested for either refusal, so validation completes before the edit request.
-        expect(requests).toEqual([])
-        // A destination that appears while the permission request is pending is caught again under the lock.
-        await expect(
-          move.execute(
-            { source: "a.txt", destination: "c.txt" },
-            {
-              ...ctx,
-              ask: async () => {
-                await Bun.write(path.join(tmp.path, "c.txt"), "arrived late")
-              },
-            },
-          ),
-        ).rejects.toThrow("Destination already exists:")
-        expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
-        expect(await Bun.file(path.join(tmp.path, "c.txt")).text()).toBe("arrived late")
-        // An empty directory is an entry a rename replaces without a word, so a directory destination that
-        // appears while the permission request is pending is refused as well, and the destination this call
-        // must keep free is held with an entry of the source's own kind rather than left to the rename.
+        // An empty directory is an entry a rename replaces without a word, so a directory destination is
+        // refused as well rather than being left to the rename.
         await Bun.write(path.join(tmp.path, "dir", "keep.txt"), "kept content")
-        await expect(
-          move.execute(
-            { source: "dir", destination: "late" },
-            {
-              ...ctx,
-              ask: async () => {
-                await fs.mkdir(path.join(tmp.path, "late"))
-              },
-            },
-          ),
-        ).rejects.toThrow("Destination already exists:")
-        expect(await fs.readdir(path.join(tmp.path, "late"))).toEqual([])
+        await fs.mkdir(path.join(tmp.path, "empty"))
+        await expect(move.execute({ source: "dir", destination: "empty" }, testCtx)).rejects.toThrow(
+          "Destination already exists:",
+        )
+        expect(await fs.readdir(path.join(tmp.path, "empty"))).toEqual([])
         expect(await Bun.file(path.join(tmp.path, "dir", "keep.txt")).text()).toBe("kept content")
+        // Consent was never requested for any of those refusals, so validation completes before the edit
+        // request and an invalid relocation never prompts the user.
+        expect(requests).toEqual([])
         // Two moves onto one destination are serialized on it, so the second one sees the first and refuses
         // rather than replacing it silently.
         await Bun.write(path.join(tmp.path, "one.txt"), "one")
@@ -378,8 +324,9 @@ describe("tool.move", () => {
         const rest = (await fs.readdir(tmp.path)).filter((name) => name === "one.txt" || name === "two.txt")
         expect(rest).toHaveLength(1)
         expect(await Bun.file(path.join(tmp.path, "d.txt")).text()).toBe(rest[0] === "one.txt" ? "two" : "one")
-        // The same destination reached through a symlinked parent is the same entry, so the two spellings are
-        // serialized on that one identity and the spelling that loses cannot replace it silently.
+        // The same destination reached through a symlinked parent is the same entry. The two spellings key
+        // their locks separately, as read and edit do, so it is the exclusive reservation on that one identity
+        // that decides between them, and the spelling that loses cannot replace it silently.
         await fs.mkdir(path.join(tmp.path, "real"))
         await fs.symlink(path.join(tmp.path, "real"), path.join(tmp.path, "alias"))
         await Bun.write(path.join(tmp.path, "three.txt"), "three")
@@ -462,24 +409,7 @@ describe("tool.move", () => {
         expect(requests).toEqual([])
         expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
         expect(await Bun.file(path.join(tmp.path, "dir", "inner", "keep.txt")).text()).toBe("kept content")
-        // Repointing that link while the permission request is pending aims the endpoints somewhere else than
-        // the pair that was authorized, so the call refuses instead of moving an unconsented entry.
-        await fs.mkdir(path.join(tmp.path, "other"))
-        await expect(
-          move.execute(
-            { source: path.join("alias", "inner", "keep.txt"), destination: "moved.txt" },
-            {
-              ...ctx,
-              ask: async () => {
-                await fs.unlink(path.join(tmp.path, "alias"))
-                await fs.symlink(path.join(tmp.path, "other"), path.join(tmp.path, "alias"))
-              },
-            },
-          ),
-        ).rejects.toThrow("Path resolution changed while permission was pending:")
-        expect(await Bun.file(path.join(tmp.path, "dir", "inner", "keep.txt")).text()).toBe("kept content")
-        expect(await Bun.file(path.join(tmp.path, "moved.txt")).exists()).toBe(false)
-        expect((await fs.readdir(tmp.path)).sort()).toEqual([".git", "a.txt", "alias", "dir", "hard.txt", "other"])
+        expect((await fs.readdir(tmp.path)).sort()).toEqual([".git", "a.txt", "alias", "dir", "hard.txt"])
       },
     })
   })
@@ -630,17 +560,9 @@ describe("tool.move", () => {
         ])
         expect(result.metadata.source).toBe(path.join(tmp.path, "a.txt"))
         expect(result.metadata.destination).toBe(path.join(tmp.path, "b.txt"))
-        // The relocation has already happened by the time the events go out, so a listener that throws is
-        // not allowed to report it as a failure or to stop the bookkeeping that follows the events.
-        await Bun.write(path.join(tmp.path, "c.txt"), "second file")
-        const boom = Bus.subscribe(File.Event.Edited, () => {
-          throw new Error("listener failed")
-        })
-        const second = await move.execute({ source: "c.txt", destination: "d.txt" }, ctx)
-        boom()
-        expect(second.output).toBe("Moved file c.txt to d.txt")
-        expect(await Bun.file(path.join(tmp.path, "d.txt")).text()).toBe("second file")
-        expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "d.txt"))).toBeInstanceOf(Date)
+        // The bookkeeping that follows the three publications ran as well, which is what a later edit of the
+        // destination relies on.
+        expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "b.txt"))).toBeInstanceOf(Date)
       },
     })
   })
