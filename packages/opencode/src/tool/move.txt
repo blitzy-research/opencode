@@ -8,4 +8,3 @@ Usage:
 - The source must exist, and it must resolve to a different path than the destination, with neither path nested inside the other. Neither path may be empty or the project directory itself.
 - Prefer this tool over running `mv` through the bash tool because it requests targeted `edit` permission for the destination and notifies the editor. File moves also notify the language server.
 - Only one entry can be moved per call. Globs and wildcards are not supported, and a path containing `*` or `?` is rejected, so make a separate call for each file or directory you need to move.
-- A symbolic link is moved as the link itself, not as the file or directory it points to.
