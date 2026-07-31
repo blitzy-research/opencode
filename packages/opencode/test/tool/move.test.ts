@@ -8,6 +8,7 @@ import type { PermissionNext } from "../../src/permission/next"
 import { Bus } from "../../src/bus"
 import { File } from "../../src/file"
 import { FileWatcher } from "../../src/file/watcher"
+import { FileTime } from "../../src/file/time"
 
 // The tool renders its title, output and edit pattern relative to Instance.worktree, and a non-git project
 // reports "/" there, so every fixture below is git backed to keep the expected strings literal.
@@ -40,6 +41,17 @@ describe("tool.move", () => {
         expect(result.metadata.destination).toBe(path.join(tmp.path, "b.txt"))
         expect(result.metadata.directory).toBe(false)
         expect(result.metadata.overwritten).toBe(false)
+        // The destination is recorded as read for the session, which is what a later edit of it relies on.
+        expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "b.txt"))).toBeInstanceOf(Date)
+        // A symbolic link is an entry of its own, so even a dangling one moves, and it arrives as the link
+        // itself rather than as whatever it points at.
+        await fs.symlink("ghost.txt", path.join(tmp.path, "link.txt"))
+        const link = await move.execute({ source: "link.txt", destination: "moved.txt" }, ctx)
+        expect(await fs.lstat(path.join(tmp.path, "moved.txt")).then((stat) => stat.isSymbolicLink())).toBe(true)
+        expect(await fs.readlink(path.join(tmp.path, "moved.txt"))).toBe("ghost.txt")
+        expect(await fs.readdir(tmp.path)).not.toContain("link.txt")
+        expect(link.output).toBe("Moved file link.txt to moved.txt")
+        expect(link.metadata.directory).toBe(false)
       },
     })
   })
@@ -144,14 +156,50 @@ describe("tool.move", () => {
 
   test("throws when the source does not exist", async () => {
     await using tmp = await tmpdir({ git: true })
+    await Bun.write(path.join(tmp.path, "a.txt"), "hello world")
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
         const move = await MoveTool.init()
-        await expect(move.execute({ source: "missing.txt", destination: "b.txt" }, ctx)).rejects.toThrow(
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const testCtx = {
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+          },
+        }
+        await expect(move.execute({ source: "missing.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
           "File or directory not found:",
         )
         expect(await Bun.file(path.join(tmp.path, "b.txt")).exists()).toBe(false)
+        // An empty path, or one shaped like a glob, is refused by the schema before execute runs at all.
+        await expect(move.execute({ source: "", destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        await expect(move.execute({ source: "a.txt", destination: "" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        await expect(move.execute({ source: "*.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        await expect(move.execute({ source: "a.txt", destination: "b?.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        // None of those four asked for consent, so a wildcard never reaches a permission pattern.
+        expect(requests).toEqual([])
+        // A source that disappears while the permission request is pending is caught again under the lock.
+        await expect(
+          move.execute(
+            { source: "a.txt", destination: "c.txt" },
+            {
+              ...ctx,
+              ask: async () => {
+                await fs.rm(path.join(tmp.path, "a.txt"))
+              },
+            },
+          ),
+        ).rejects.toThrow("File or directory not found:")
+        expect(await fs.readdir(tmp.path)).toEqual([".git"])
       },
     })
   })
@@ -164,12 +212,61 @@ describe("tool.move", () => {
       directory: tmp.path,
       fn: async () => {
         const move = await MoveTool.init()
-        await expect(move.execute({ source: "a.txt", destination: "b.txt" }, ctx)).rejects.toThrow(
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const testCtx = {
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+          },
+        }
+        await expect(move.execute({ source: "a.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
           "Destination already exists:",
         )
         // Neither endpoint changed, which is what proves the guard runs ahead of every mutation.
         expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
         expect(await Bun.file(path.join(tmp.path, "b.txt")).text()).toBe("existing")
+        // A dangling link is an entry of its own, so it is protected without being followed.
+        await fs.symlink("ghost.txt", path.join(tmp.path, "link.txt"))
+        await expect(move.execute({ source: "a.txt", destination: "link.txt" }, testCtx)).rejects.toThrow(
+          "Destination already exists:",
+        )
+        expect(await fs.readlink(path.join(tmp.path, "link.txt"))).toBe("ghost.txt")
+        // Consent was never requested for either refusal, so validation completes before the edit request.
+        expect(requests).toEqual([])
+        // A destination that appears while the permission request is pending is caught again under the lock.
+        await expect(
+          move.execute(
+            { source: "a.txt", destination: "c.txt" },
+            {
+              ...ctx,
+              ask: async () => {
+                await Bun.write(path.join(tmp.path, "c.txt"), "arrived late")
+              },
+            },
+          ),
+        ).rejects.toThrow("Destination already exists:")
+        expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
+        expect(await Bun.file(path.join(tmp.path, "c.txt")).text()).toBe("arrived late")
+        // Two moves onto one destination are serialized on it, so the second one sees the first and refuses
+        // rather than replacing it silently.
+        await Bun.write(path.join(tmp.path, "one.txt"), "one")
+        await Bun.write(path.join(tmp.path, "two.txt"), "two")
+        const outcomes = await Promise.all([
+          move.execute({ source: "one.txt", destination: "d.txt" }, ctx).then(
+            () => "moved",
+            (err: Error) => err.message,
+          ),
+          move.execute({ source: "two.txt", destination: "d.txt" }, ctx).then(
+            () => "moved",
+            (err: Error) => err.message,
+          ),
+        ])
+        expect(outcomes.filter((outcome) => outcome === "moved")).toHaveLength(1)
+        expect(outcomes.find((outcome) => outcome !== "moved")).toContain("Destination already exists:")
+        // Exactly one source survives, and the destination holds the content of the one that moved.
+        const rest = (await fs.readdir(tmp.path)).filter((name) => name === "one.txt" || name === "two.txt")
+        expect(rest).toHaveLength(1)
+        expect(await Bun.file(path.join(tmp.path, "d.txt")).text()).toBe(rest[0] === "one.txt" ? "two" : "one")
       },
     })
   })
@@ -177,15 +274,44 @@ describe("tool.move", () => {
   test("throws when source and destination are the same path", async () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, "a.txt"), "hello world")
+    await Bun.write(path.join(tmp.path, "dir", "inner", "keep.txt"), "kept content")
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
         const move = await MoveTool.init()
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const testCtx = {
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+          },
+        }
         // One relative and one absolute spelling of the same entry, so resolution decides the equality.
-        await expect(move.execute({ source: "a.txt", destination: path.join(tmp.path, "a.txt") }, ctx)).rejects.toThrow(
-          "Source and destination are the same path:",
+        await expect(
+          move.execute({ source: "a.txt", destination: path.join(tmp.path, "a.txt") }, testCtx),
+        ).rejects.toThrow("Source and destination are the same path:")
+        // The project root is refused in either position, because an overwrite would remove it recursively.
+        await expect(move.execute({ source: ".", destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "Source must not be the project root:",
         )
+        await expect(move.execute({ source: tmp.path, destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "Source must not be the project root:",
+        )
+        await expect(move.execute({ source: "a.txt", destination: "." }, testCtx)).rejects.toThrow(
+          "Destination must not be the project root:",
+        )
+        // Neither endpoint may contain the other, in either direction.
+        await expect(move.execute({ source: "dir", destination: path.join("dir", "inner") }, testCtx)).rejects.toThrow(
+          "Source and destination overlap:",
+        )
+        await expect(move.execute({ source: path.join("dir", "inner"), destination: "dir" }, testCtx)).rejects.toThrow(
+          "Source and destination overlap:",
+        )
+        // Every refusal came before consent, and the project is exactly as it was seeded.
+        expect(requests).toEqual([])
         expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
+        expect(await Bun.file(path.join(tmp.path, "dir", "inner", "keep.txt")).text()).toBe("kept content")
+        expect((await fs.readdir(tmp.path)).sort()).toEqual([".git", "a.txt", "dir"])
       },
     })
   })
@@ -224,6 +350,16 @@ describe("tool.move", () => {
         expect(result.output).toBe("Moved directory dir to moved")
         expect(result.metadata.directory).toBe(true)
         expect(result.metadata.overwritten).toBe(false)
+        // A link is classified by the entry, never by its target, so a link to a directory travels as a
+        // single link and the directory it names is left where it is.
+        await fs.symlink("moved", path.join(tmp.path, "dirlink"))
+        const link = await move.execute({ source: "dirlink", destination: "movedlink" }, ctx)
+        expect(await fs.lstat(path.join(tmp.path, "movedlink")).then((stat) => stat.isSymbolicLink())).toBe(true)
+        expect(await fs.readlink(path.join(tmp.path, "movedlink"))).toBe("moved")
+        expect(await fs.readdir(tmp.path)).not.toContain("dirlink")
+        expect(await fs.readdir(path.join(tmp.path, "moved"))).toEqual(["nested"])
+        expect(link.output).toBe("Moved file dirlink to movedlink")
+        expect(link.metadata.directory).toBe(false)
       },
     })
   })
@@ -263,15 +399,20 @@ describe("tool.move", () => {
           events.push(`${event.properties.event}:${event.properties.file}`)
         })
         const move = await MoveTool.init()
+        // Every publication is awaited and Bus.publish awaits its subscribers, so the three events have
+        // already arrived by the time execute resolves and no wait is needed here.
         const result = await move.execute({ source: "a.txt", destination: "b.txt" }, ctx)
-        await new Promise((resolve) => setTimeout(resolve, 100))
         unsub()
         unwatch()
+        // The expectations come from the fixture rather than from the result, so the payloads are proven
+        // independently of the metadata the same call returned.
         expect(events).toEqual([
-          `edited:${result.metadata.destination}`,
-          `unlink:${result.metadata.source}`,
-          `add:${result.metadata.destination}`,
+          `edited:${path.join(tmp.path, "b.txt")}`,
+          `unlink:${path.join(tmp.path, "a.txt")}`,
+          `add:${path.join(tmp.path, "b.txt")}`,
         ])
+        expect(result.metadata.source).toBe(path.join(tmp.path, "a.txt"))
+        expect(result.metadata.destination).toBe(path.join(tmp.path, "b.txt"))
       },
     })
   })
