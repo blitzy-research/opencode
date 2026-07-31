@@ -207,6 +207,34 @@ describe("tool.move", () => {
         await expect(move.execute({ source: "a.txt", destination: "" }, testCtx)).rejects.toThrow(
           "The move tool was called with invalid arguments",
         )
+        // A glob character is refused by the schema in either position, because the destination becomes a
+        // remembered permission pattern and one entry moves per call.
+        await expect(move.execute({ source: "*.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        await expect(move.execute({ source: "a.txt", destination: "b?.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        // A clean spelling can still resolve through a link into a real directory whose own name holds a glob
+        // character, and that is refused too, reporting the spelling that was passed rather than the resolved
+        // path the caller has not been granted yet.
+        await fs.mkdir(path.join(tmp.path, "star*dir"))
+        await Bun.write(path.join(tmp.path, "star*dir", "inner.txt"), "inner")
+        await fs.symlink(path.join(tmp.path, "star*dir"), path.join(tmp.path, "plain"))
+        const resolved = await move
+          .execute({ source: path.join("plain", "inner.txt"), destination: "c.txt" }, testCtx)
+          .then(
+            () => "moved",
+            (err: Error) => err.message,
+          )
+        expect(resolved).toContain("Source resolves to a path containing * or ?:")
+        expect(resolved).toContain(path.join(tmp.path, "plain", "inner.txt"))
+        expect(resolved).not.toContain("star*dir")
+        await expect(
+          move.execute({ source: "a.txt", destination: path.join("plain", "moved.txt") }, testCtx),
+        ).rejects.toThrow("Destination resolves to a path containing * or ?:")
+        expect(await Bun.file(path.join(tmp.path, "star*dir", "inner.txt")).text()).toBe("inner")
+        expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
         expect(requests).toEqual([])
         // Two calls competing for one source: only one of them can relocate it, and the one that loses
         // reports the missing source rather than a raw errno while leaving its own destination untouched.
@@ -352,15 +380,16 @@ describe("tool.move", () => {
         await expect(
           move.execute({ source: "a.txt", destination: path.join(tmp.path, "a.txt") }, testCtx),
         ).rejects.toThrow("Source and destination are the same path:")
-        // The project root is refused in either position, because an overwrite would remove it recursively.
+        // The project directory and the repository root are refused in either position, because an overwrite
+        // would remove one of them recursively.
         await expect(move.execute({ source: ".", destination: "b.txt" }, testCtx)).rejects.toThrow(
-          "Source must not be the project root:",
+          "Source must not be the project directory or the repository root:",
         )
         await expect(move.execute({ source: tmp.path, destination: "b.txt" }, testCtx)).rejects.toThrow(
-          "Source must not be the project root:",
+          "Source must not be the project directory or the repository root:",
         )
         await expect(move.execute({ source: "a.txt", destination: "." }, testCtx)).rejects.toThrow(
-          "Destination must not be the project root:",
+          "Destination must not be the project directory or the repository root:",
         )
         await expect(move.execute({ source: "dir", destination: path.join("dir", "inner") }, testCtx)).rejects.toThrow(
           "Source and destination overlap:",
@@ -523,8 +552,8 @@ describe("tool.move", () => {
         })
         const move = await MoveTool.init()
         const result = await move.execute({ source: "a.txt", destination: "b.txt" }, ctx)
-        // Bus.publish awaits its subscribers, so ordering is already settled; this wait is a grace period.
-        await new Promise((resolve) => setTimeout(resolve, 100))
+        // No wait is needed before unsubscribing: Bus.publish awaits its subscribers, so all three events have
+        // already been delivered in order by the time execute resolves.
         unsub()
         unwatch()
         expect(events).toEqual([

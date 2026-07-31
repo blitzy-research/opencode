@@ -56,10 +56,11 @@ export const MoveTool = Tool.define("move", {
         }
       }),
     )
-    // Canonicalized parents can introduce * or ?, so reject them before a remembered pattern is built.
-    if (/[*?]/.test(source.real)) throw new Error(`Source resolves to a path containing * or ?: ${source.real}`)
+    // Canonicalized parents can introduce * or ?, so reject them before a remembered pattern is built. The
+    // spelling the caller passed is the one reported, because consent for the resolved path comes below.
+    if (/[*?]/.test(source.real)) throw new Error(`Source resolves to a path containing * or ?: ${source.full}`)
     if (/[*?]/.test(destination.real))
-      throw new Error(`Destination resolves to a path containing * or ?: ${destination.real}`)
+      throw new Error(`Destination resolves to a path containing * or ?: ${destination.full}`)
 
     // Guard the caller's spelling and the canonical path of each endpoint before existence and identity
     // checks, with the default parent glob, because a move mutates each parent, not a directory's contents.
@@ -81,9 +82,10 @@ export const MoveTool = Tool.define("move", {
           .catch(() => dir),
       ),
     )
-    if (roots.includes(source.real)) throw new Error(`Source must not be the project root: ${source.full}`)
+    if (roots.includes(source.real))
+      throw new Error(`Source must not be the project directory or the repository root: ${source.full}`)
     if (roots.includes(destination.real))
-      throw new Error(`Destination must not be the project root: ${destination.full}`)
+      throw new Error(`Destination must not be the project directory or the repository root: ${destination.full}`)
     // An entry cannot be moved inside itself, and a destination cannot swallow its own source. A contained
     // path stays on the same root and does not begin with a complete ".." segment.
     if (
@@ -159,75 +161,89 @@ export const MoveTool = Tool.define("move", {
               .concat(created)
           : [],
       )
+      // Undo those parent directories, deepest first: rmdir refuses one that is not empty, so walking back up
+      // stops at the first directory that is still in use and only what this call added and nobody else
+      // touched comes down.
+      const prune = () =>
+        parents.reduce(
+          (prior, dir) =>
+            prior.then((going) =>
+              going
+                ? fs.rmdir(dir).then(
+                    () => true,
+                    () => false,
+                  )
+                : false,
+            ),
+          Promise.resolve(true),
+        )
 
       // Reserve a free destination with an entry of the source's kind, or stage an existing destination aside,
       // so cooperating moves cannot displace one another silently and the old entry survives for a rollback.
       const aside = `${destination.real}.opencode-move-${Bun.randomUUIDv7()}`
+      // A cross device copy is assembled here first, beside the destination and so on its device, because a
+      // copy of a link cannot be written onto the path the reservation already occupies.
+      const copy = `${destination.real}.opencode-move-${Bun.randomUUIDv7()}`
       if (!exists)
         await (
           directory ? fs.mkdir(destination.real) : fs.open(destination.real, "wx").then((handle) => handle.close())
         ).catch(async (err: NodeJS.ErrnoException) => {
           if (err.code !== "EEXIST") throw err
-          // The entry in the way belongs to another writer and is left alone, and so is the directory it
-          // sits in: rmdir refuses one that is not empty, so walking back up stops at the first directory
-          // that is still in use and only what this call added and nobody else touched comes down.
-          await parents.reduce(
-            (prior, dir) =>
-              prior.then((going) =>
-                going
-                  ? fs.rmdir(dir).then(
-                      () => true,
-                      () => false,
-                    )
-                  : false,
-              ),
-            Promise.resolve(true),
-          )
+          // The entry in the way belongs to another writer and is left alone, and so is the directory it sits
+          // in, because pruning stops at a directory that is still in use.
+          await prune()
           throw new Error(`Destination already exists: ${destination.full}. Pass overwrite: true to replace it`)
         })
-      if (exists) await fs.rename(destination.real, aside)
+      if (exists)
+        await fs.rename(destination.real, aside).catch(async (err: Error) => {
+          // Nothing has been relocated yet, so the parents this call created are its only trace to remove.
+          await prune()
+          throw err
+        })
 
       // Rename carries a whole directory subtree atomically on one device and relocates a symbolic link as
       // the link itself rather than as its target, matching `mv`.
       await fs
         .rename(source.real, destination.real)
         .catch(async (err: NodeJS.ErrnoException) => {
-          // Report a source that raced away as missing. On EXDEV, copy without dereferencing links and
-          // remove the source only once the copy has succeeded.
+          // Report a source that raced away as missing.
           if (err.code === "ENOENT" && !(await fs.lstat(source.real).catch(() => undefined)))
             throw new Error(`File or directory not found: ${source.full}`)
+          // Windows refuses a rename onto a directory, including the empty one reserved here, so that
+          // reservation is given up and the rename tried once more. rmdir refuses a directory that is not
+          // empty, so a reservation another writer has since filled stops the retry and the failure stands.
+          if (!exists && directory && ["EPERM", "EACCES", "EEXIST", "ENOTEMPTY"].includes(err.code ?? ""))
+            return fs.rmdir(destination.real).then(
+              () => fs.rename(source.real, destination.real),
+              () => {
+                throw err
+              },
+            )
           if (err.code !== "EXDEV") throw err
+          // On EXDEV, copy without dereferencing links, and remove the source only once the copy has
+          // succeeded. A copy of a link cannot be written onto the reserved destination, so it is assembled
+          // beside it and a single rename then puts the finished entry in its place.
           await fs
-            .cp(source.real, destination.real, {
+            .cp(source.real, copy, {
               recursive: true,
               force: true,
               dereference: false,
               verbatimSymlinks: true,
             })
+            .then(() => fs.rename(copy, destination.real))
             .then(() => fs.rm(source.real, { recursive: true, force: true }))
         })
         .catch(async (cause: Error) => {
-          // Attempt to restore the pre-move state: clear this call's destination, put back an entry that was
-          // staged aside and prune the parents it created. A rollback that fails in turn is reported together
-          // with the cause and names the path the staged entry is recoverable from.
+          // Attempt to restore the pre-move state: drop an unfinished cross device copy, clear this call's
+          // destination, put back an entry that was staged aside and prune the parents it created. A rollback
+          // that fails in turn is reported together with the cause and names the path the staged entry is
+          // recoverable from.
           if (
             !(await fs
-              .rm(destination.real, { recursive: true, force: true })
+              .rm(copy, { recursive: true, force: true })
+              .then(() => fs.rm(destination.real, { recursive: true, force: true }))
               .then(() => (exists ? fs.rename(aside, destination.real) : undefined))
-              .then(() =>
-                parents.reduce(
-                  (prior, dir) =>
-                    prior.then((going) =>
-                      going
-                        ? fs.rmdir(dir).then(
-                            () => true,
-                            () => false,
-                          )
-                        : false,
-                    ),
-                  Promise.resolve(true),
-                ),
-              )
+              .then(() => prune())
               .then(
                 () => true,
                 () => false,
@@ -242,16 +258,6 @@ export const MoveTool = Tool.define("move", {
           throw cause
         })
 
-      // Delete the staged destination now that the move is committed. A failure is surfaced, because leaving
-      // replaced content beside the new destination is incomplete cleanup.
-      if (exists)
-        await fs.rm(aside, { recursive: true, force: true }).catch((cause: Error) => {
-          throw new Error(
-            `Moved ${from} to ${to}, but what it replaced could not be removed from ${aside}: ${cause.message}`,
-            { cause },
-          )
-        })
-
       // Publish edited, then the source unlink and the destination add, using the caller visible spellings
       // that existing listeners are keyed on.
       await Bus.publish(File.Event.Edited, { file: destination.full })
@@ -262,6 +268,17 @@ export const MoveTool = Tool.define("move", {
       // for diagnostics, but this tool neither queries nor appends them.
       FileTime.read(ctx.sessionID, destination.full)
       if (!directory) await LSP.touchFile(destination.full, true)
+
+      // Delete the staged destination now that the move is committed. A failure is surfaced, because leaving
+      // replaced content beside the new destination is incomplete cleanup, and it is surfaced only after the
+      // events above, so a relocation that is already on disk is never left unannounced.
+      if (exists)
+        await fs.rm(aside, { recursive: true, force: true }).catch((cause: Error) => {
+          throw new Error(
+            `Moved ${from} to ${to}, but what it replaced could not be removed from ${aside}: ${cause.message}`,
+            { cause },
+          )
+        })
 
       return {
         title: `${from} -> ${to}`,
