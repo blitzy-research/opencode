@@ -70,6 +70,42 @@ describe("tool.move", () => {
         expect(await Bun.file(path.join(tmp.path, "a.txt")).exists()).toBe(false)
         expect(result.title).toBe(`a.txt -> ${nested}`)
         expect(result.output).toBe(`Moved file a.txt to ${nested}`)
+        // A name the filesystem cannot hold refuses the destination only once those parents exist, and a call
+        // that relocated nothing leaves nothing behind, so the whole chain it created comes back down.
+        const events: string[] = []
+        const unwatch = Bus.subscribe(FileWatcher.Event.Updated, (event) => {
+          events.push(`${event.properties.event}:${event.properties.file}`)
+        })
+        const refused = await move
+          .execute({ source: nested, destination: path.join("p1", "p2", "p3", "z".repeat(300) + ".txt") }, ctx)
+          .then(
+            () => "moved",
+            (err: NodeJS.ErrnoException) => err.code,
+          )
+        unwatch()
+        expect(refused).toBe("ENAMETOOLONG")
+        expect(await fs.readdir(tmp.path)).not.toContain("p1")
+        expect(events).toEqual([])
+        expect(await Bun.file(path.join(tmp.path, nested)).text()).toBe("hello world")
+        // Only what this call added comes down: a destination another writer takes inside the same new chain
+        // keeps that chain, because pruning stops at a directory which is still in use.
+        const taken = await move
+          .execute(
+            { source: nested, destination: path.join("e1", "e2", "taken.txt") },
+            {
+              ...ctx,
+              ask: async () => {
+                await Bun.write(path.join(tmp.path, "e1", "e2", "taken.txt"), "another writer")
+              },
+            },
+          )
+          .then(
+            () => "moved",
+            (err: Error) => err.message,
+          )
+        expect(taken).toContain("Destination already exists:")
+        expect(await Bun.file(path.join(tmp.path, "e1", "e2", "taken.txt")).text()).toBe("another writer")
+        expect(await Bun.file(path.join(tmp.path, nested)).text()).toBe("hello world")
       },
     })
   })

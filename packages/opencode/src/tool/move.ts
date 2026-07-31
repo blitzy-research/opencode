@@ -188,10 +188,12 @@ export const MoveTool = Tool.define("move", {
         await (
           directory ? fs.mkdir(destination.real) : fs.open(destination.real, "wx").then((handle) => handle.close())
         ).catch(async (err: NodeJS.ErrnoException) => {
-          if (err.code !== "EEXIST") throw err
-          // The entry in the way belongs to another writer and is left alone, and so is the directory it sits
-          // in, because pruning stops at a directory that is still in use.
+          // Whatever refused the reservation, a name the filesystem cannot hold as much as a destination another
+          // writer has taken, the parents this call created are its only trace, so they come down before the
+          // failure leaves here. An entry in the way and the directory holding it are left alone, because
+          // pruning stops at a directory that is still in use.
           await prune()
+          if (err.code !== "EEXIST") throw err
           throw new Error(`Destination already exists: ${destination.full}. Pass overwrite: true to replace it`)
         })
       if (exists)
