@@ -16,16 +16,20 @@ export const MoveTool = Tool.define("move", {
   description: DESCRIPTION,
   parameters: z.object({
     // A permission pattern is built from these values, so the schema refuses the two glob characters that
-    // would otherwise broaden an external_directory grant past the path the user approved.
+    // would otherwise broaden an external_directory grant past the path the user approved. A NUL byte is
+    // refused here as well, so a path no filesystem can hold is reported by this tool rather than by the
+    // runtime rejecting its own argument further down.
     source: z
       .string()
       .min(1)
       .refine((value) => !/[*?]/.test(value), "Source must not contain * or ?")
+      .refine((value) => !value.includes("\u0000"), "Source must not contain a NUL byte")
       .describe("The file or directory to move, as an absolute or project relative path, without * or ?"),
     destination: z
       .string()
       .min(1)
       .refine((value) => !/[*?]/.test(value), "Destination must not contain * or ?")
+      .refine((value) => !value.includes("\u0000"), "Destination must not contain a NUL byte")
       .describe("The path to move it to, as an absolute or project relative path, without * or ?"),
     overwrite: z.boolean().optional().describe("Replace the destination if it already exists (defaults to false)"),
   }),
@@ -98,12 +102,11 @@ export const MoveTool = Tool.define("move", {
       )
 
     // lstat joins the stat based helpers so a dangling link counts as a movable entry and a directory is
-    // still detected correctly.
+    // still detected correctly. The kind this entry reports is settled again once permission has returned,
+    // because it decides how the destination is reserved, what the language server is told and what is
+    // reported, and only the entry that is still there when the move runs may decide any of that.
     const stat = await fs.lstat(source.real).catch(() => undefined)
     if (!(await Filesystem.exists(source.real)) && !stat) throw new Error(`File or directory not found: ${source.full}`)
-    // The kind is decided by the entry itself, so a link to a directory is relocated as the single link it
-    // is, and the shared helper classifies everything that is not a link.
-    const directory = stat?.isSymbolicLink() === false && (await Filesystem.isDir(source.real))
 
     // fs.rename replaces an existing entry silently, so this probe drives overwrite handling and metadata.
     const entry = await fs.lstat(destination.real).catch(() => undefined)
@@ -149,21 +152,41 @@ export const MoveTool = Tool.define("move", {
       )
         throw new Error(`Path resolution changed while permission was pending: ${source.full} -> ${destination.full}`)
 
-      // A rename into a missing parent fails with ENOENT. Track each parent mkdir created, deepest first, so
-      // a rollback removes only the directories this call introduced.
-      const parents = await fs.mkdir(path.dirname(destination.real), { recursive: true }).then((created) =>
-        created
-          ? path
-              .relative(created, path.dirname(destination.real))
-              .split(path.sep)
-              .filter((part) => part !== "")
-              .map((_, index, parts) => path.join(created, ...parts.slice(0, parts.length - index)))
-              .concat(created)
-          : [],
+      // Stat the source again, before anything is created, to catch an entry swapped in while permission was
+      // pending. dev and ino name the entry itself, and the kind is compared as well because a freed inode
+      // number can be handed out again to an entry of another kind. Relocating a substitute would report the
+      // entry that was validated while moving the one that replaced it, so it is refused here instead.
+      const current = await fs.lstat(source.real).catch(() => undefined)
+      if (!current) throw new Error(`File or directory not found: ${source.full}`)
+      if (
+        !stat ||
+        current.dev !== stat.dev ||
+        current.ino !== stat.ino ||
+        current.isDirectory() !== stat.isDirectory() ||
+        current.isSymbolicLink() !== stat.isSymbolicLink()
       )
+        throw new Error(`Source changed while permission was pending: ${source.full}`)
+      // The kind comes from the entry itself, so a link to a directory is relocated as the single link it is.
+      const directory = current.isDirectory()
+
+      // A rename into a missing parent fails with ENOENT, so the destination's parents are created below. The
+      // ones this call is about to add are collected first, deepest first, rather than read back from the
+      // mkdir result, because a recursive mkdir that fails partway still leaves what it did create behind.
+      const parents = await Promise.all(
+        path
+          .relative(path.parse(destination.real).root, path.dirname(destination.real))
+          .split(path.sep)
+          .filter((part) => part !== "")
+          .map((_, index, parts) =>
+            path.join(path.parse(destination.real).root, ...parts.slice(0, parts.length - index)),
+          )
+          .map((dir) => Filesystem.exists(dir).then((found) => (found ? "" : dir))),
+      ).then((list) => list.filter((dir) => dir !== ""))
       // Undo those parent directories, deepest first: rmdir refuses one that is not empty, so walking back up
       // stops at the first directory that is still in use and only what this call added and nobody else
-      // touched comes down.
+      // touched comes down. A path that rmdir refused and that is not there either was never created, by a
+      // failed mkdir or because the filesystem cannot hold that name, and it does not stop the walk. Anything
+      // that is there, including a file or a link standing where a parent was wanted, does.
       const prune = () =>
         parents.reduce(
           (prior, dir) =>
@@ -171,12 +194,19 @@ export const MoveTool = Tool.define("move", {
               going
                 ? fs.rmdir(dir).then(
                     () => true,
-                    () => false,
+                    () => Filesystem.exists(dir).then((found) => !found),
                   )
                 : false,
             ),
           Promise.resolve(true),
         )
+      await fs.mkdir(path.dirname(destination.real), { recursive: true }).catch(async (cause: Error) => {
+        // Whatever refused the parents, an entry standing in the way as much as a name the filesystem cannot
+        // hold, the directories this call did create come down before the failure leaves here, and the
+        // platform reason travels inside a message that names the destination it was for.
+        await prune()
+        throw new Error(`Destination parents could not be created for ${to}: ${cause.message}`, { cause })
+      })
 
       // Reserve a free destination with an entry of the source's kind, or stage an existing destination aside,
       // so cooperating moves cannot displace one another silently and the old entry survives for a rollback.

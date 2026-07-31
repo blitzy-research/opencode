@@ -106,6 +106,20 @@ describe("tool.move", () => {
         expect(taken).toContain("Destination already exists:")
         expect(await Bun.file(path.join(tmp.path, "e1", "e2", "taken.txt")).text()).toBe("another writer")
         expect(await Bun.file(path.join(tmp.path, nested)).text()).toBe("hello world")
+        // A parent that cannot be created is reported by this tool rather than as a bare platform error, and
+        // the entry standing where that parent was wanted is left exactly as it was.
+        await Bun.write(path.join(tmp.path, "blocker.txt"), "blocking")
+        await expect(
+          move.execute({ source: nested, destination: path.join("blocker.txt", "b.txt") }, ctx),
+        ).rejects.toThrow("Destination parents could not be created for")
+        expect(await Bun.file(path.join(tmp.path, "blocker.txt")).text()).toBe("blocking")
+        // A recursive mkdir that fails partway leaves nothing standing either: the part of the chain it did
+        // create before the filesystem refused the name comes back down with it.
+        await expect(
+          move.execute({ source: nested, destination: path.join("r1", "r2", "w".repeat(300), "b.txt") }, ctx),
+        ).rejects.toThrow("Destination parents could not be created for")
+        expect(await fs.readdir(tmp.path)).not.toContain("r1")
+        expect(await Bun.file(path.join(tmp.path, nested)).text()).toBe("hello world")
       },
     })
   })
@@ -249,6 +263,14 @@ describe("tool.move", () => {
           "The move tool was called with invalid arguments",
         )
         await expect(move.execute({ source: "a.txt", destination: "b?.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        // No filesystem can hold a NUL byte in a path, so the schema refuses it in either position and the
+        // model is told which argument was wrong instead of reading the runtime rejecting its own argument.
+        await expect(move.execute({ source: "a\u0000.txt", destination: "b.txt" }, testCtx)).rejects.toThrow(
+          "The move tool was called with invalid arguments",
+        )
+        await expect(move.execute({ source: "a.txt", destination: "b\u0000.txt" }, testCtx)).rejects.toThrow(
           "The move tool was called with invalid arguments",
         )
         // A clean spelling can still resolve through a link into a real directory whose own name holds a glob
@@ -600,6 +622,101 @@ describe("tool.move", () => {
         expect(result.metadata.source).toBe(path.join(tmp.path, "a.txt"))
         expect(result.metadata.destination).toBe(path.join(tmp.path, "b.txt"))
         expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "b.txt"))).toBeInstanceOf(Date)
+      },
+    })
+  })
+
+  // The kind of the source decides how the destination is reserved, whether the language server is told and
+  // what the result reports, so it is settled again after permission returns. These two tests drive the only
+  // window where the entry that was validated can stop being the entry that would be relocated.
+  test("refuses a source replaced by a directory while permission was pending", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Bun.write(path.join(tmp.path, "a.txt"), "hello world")
+    await Bun.write(path.join(tmp.path, "b.txt"), "existing")
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const events: string[] = []
+        const unsub = Bus.subscribe(File.Event.Edited, (event) => {
+          events.push(`edited:${event.properties.file}`)
+        })
+        const unwatch = Bus.subscribe(FileWatcher.Event.Updated, (event) => {
+          events.push(`${event.properties.event}:${event.properties.file}`)
+        })
+        await Bun.write(path.join(tmp.path, "free.txt"), "hello world")
+        const move = await MoveTool.init()
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const swapping = (name: string) => ({
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+            await fs.rm(path.join(tmp.path, name))
+            await Bun.write(path.join(tmp.path, name, "inner.txt"), "swapped in")
+          },
+        })
+        await expect(
+          move.execute({ source: "a.txt", destination: "b.txt", overwrite: true }, swapping("a.txt")),
+        ).rejects.toThrow("Source changed while permission was pending:")
+        // A free destination is refused the same way rather than by the platform, so the model is told the
+        // same thing whether or not it asked to replace something.
+        await expect(move.execute({ source: "free.txt", destination: "c.txt" }, swapping("free.txt"))).rejects.toThrow(
+          "Source changed while permission was pending:",
+        )
+        unsub()
+        unwatch()
+        // Consent was asked for, and the refusal came after it with nothing relocated: the destination still
+        // holds what it held, the entry that took each source's place is untouched, the free destination was
+        // never created, and a call that published nothing also recorded nothing for a later edit.
+        expect(requests.map((req) => req.permission)).toEqual(["edit", "edit"])
+        expect(await Bun.file(path.join(tmp.path, "b.txt")).text()).toBe("existing")
+        expect(await Bun.file(path.join(tmp.path, "a.txt", "inner.txt")).text()).toBe("swapped in")
+        expect(await Bun.file(path.join(tmp.path, "free.txt", "inner.txt")).text()).toBe("swapped in")
+        expect(await fs.readdir(tmp.path)).not.toContain("c.txt")
+        expect(events).toEqual([])
+        expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "b.txt"))).toBeUndefined()
+        expect((await fs.readdir(tmp.path)).filter((name) => name.includes("opencode-move"))).toEqual([])
+      },
+    })
+  })
+
+  test("refuses a source replaced by a file while permission was pending", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Bun.write(path.join(tmp.path, "dir", "keep.txt"), "kept content")
+    await Bun.write(path.join(tmp.path, "target", "stale.txt"), "stale content")
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const events: string[] = []
+        const unsub = Bus.subscribe(File.Event.Edited, (event) => {
+          events.push(`edited:${event.properties.file}`)
+        })
+        const unwatch = Bus.subscribe(FileWatcher.Event.Updated, (event) => {
+          events.push(`${event.properties.event}:${event.properties.file}`)
+        })
+        const move = await MoveTool.init()
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const testCtx = {
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+            await fs.rm(path.join(tmp.path, "dir"), { recursive: true, force: true })
+            await Bun.write(path.join(tmp.path, "dir"), "swapped in")
+          },
+        }
+        await expect(move.execute({ source: "dir", destination: "target", overwrite: true }, testCtx)).rejects.toThrow(
+          "Source changed while permission was pending:",
+        )
+        unsub()
+        unwatch()
+        // The directory the destination held is neither replaced nor staged away, so nothing of it is lost and
+        // no staging entry is left beside it.
+        expect(requests.map((req) => req.permission)).toEqual(["edit"])
+        expect(await fs.readdir(path.join(tmp.path, "target"))).toEqual(["stale.txt"])
+        expect(await Bun.file(path.join(tmp.path, "target", "stale.txt")).text()).toBe("stale content")
+        expect(await Bun.file(path.join(tmp.path, "dir")).text()).toBe("swapped in")
+        expect(events).toEqual([])
+        expect(FileTime.get(ctx.sessionID, path.join(tmp.path, "target"))).toBeUndefined()
+        expect((await fs.readdir(tmp.path)).filter((name) => name.includes("opencode-move"))).toEqual([])
       },
     })
   })
