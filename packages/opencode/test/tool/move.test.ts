@@ -95,6 +95,24 @@ describe("tool.move", () => {
         expect(requests[0].always).toEqual(["*"])
         // Both endpoints are inside the project, so the boundary guard stays silent.
         expect(requests.find((r) => r.permission === "external_directory")).toBeUndefined()
+        // The schema refuses a wildcard in the spelling, but a link can resolve onto a directory that carries
+        // one of its own. That character would reach the pattern this call asks to remember, where it would go
+        // on matching siblings the user never saw, so both endpoints are refused once resolved and no further
+        // consent is requested for either of them.
+        await fs.mkdir(path.join(tmp.path, "star*dir"))
+        await Bun.write(path.join(tmp.path, "star*dir", "loot.txt"), "loot")
+        await fs.symlink(path.join(tmp.path, "star*dir"), path.join(tmp.path, "wild"))
+        await Bun.write(path.join(tmp.path, "c.txt"), "plain content")
+        await expect(
+          move.execute({ source: path.join("wild", "loot.txt"), destination: "d.txt" }, testCtx),
+        ).rejects.toThrow("Source resolves to a path containing * or ?:")
+        await expect(
+          move.execute({ source: "c.txt", destination: path.join("wild", "planted.txt") }, testCtx),
+        ).rejects.toThrow("Destination resolves to a path containing * or ?:")
+        expect(requests.length).toBe(1)
+        expect(await Bun.file(path.join(tmp.path, "star*dir", "loot.txt")).text()).toBe("loot")
+        expect(await Bun.file(path.join(tmp.path, "c.txt")).text()).toBe("plain content")
+        expect(await Bun.file(path.join(tmp.path, "d.txt")).exists()).toBe(false)
       },
     })
   })
@@ -247,13 +265,14 @@ describe("tool.move", () => {
         expect(outcomes.find((outcome) => outcome !== "moved")).toContain("File or directory not found:")
         expect(await Bun.file(path.join(tmp.path, "one.txt")).exists()).toBe(false)
         // One destination received the source and the other still holds exactly what it held before, so a
-        // relocation that fails never costs the entry it was going to replace.
+        // relocation that fails never costs the entry it was going to replace. A destination that is being
+        // replaced is moved aside whatever kind of entry it is, and the call that fails puts it back.
         const survivors = [
           await Bun.file(path.join(tmp.path, "keep.txt")).text(),
           await Bun.file(path.join(tmp.path, "other.txt")).text(),
         ]
         expect(survivors.filter((text) => text === "one")).toHaveLength(1)
-        expect(survivors.some((text) => text === "keep" || text === "other")).toBe(true)
+        expect(survivors.filter((text) => text === "keep" || text === "other")).toHaveLength(1)
         expect((await fs.readdir(tmp.path)).filter((name) => name.includes("opencode-move"))).toEqual([])
         // The same contention onto free destinations, where each call reserves its destination with an
         // exclusive create before relocating: the call that loses takes its reservation back down, so no
@@ -322,6 +341,23 @@ describe("tool.move", () => {
         ).rejects.toThrow("Destination already exists:")
         expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
         expect(await Bun.file(path.join(tmp.path, "c.txt")).text()).toBe("arrived late")
+        // An empty directory is an entry a rename replaces without a word, so a directory destination that
+        // appears while the permission request is pending is refused as well, and the destination this call
+        // must keep free is held with an entry of the source's own kind rather than left to the rename.
+        await Bun.write(path.join(tmp.path, "dir", "keep.txt"), "kept content")
+        await expect(
+          move.execute(
+            { source: "dir", destination: "late" },
+            {
+              ...ctx,
+              ask: async () => {
+                await fs.mkdir(path.join(tmp.path, "late"))
+              },
+            },
+          ),
+        ).rejects.toThrow("Destination already exists:")
+        expect(await fs.readdir(path.join(tmp.path, "late"))).toEqual([])
+        expect(await Bun.file(path.join(tmp.path, "dir", "keep.txt")).text()).toBe("kept content")
         // Two moves onto one destination are serialized on it, so the second one sees the first and refuses
         // rather than replacing it silently.
         await Bun.write(path.join(tmp.path, "one.txt"), "one")
@@ -412,6 +448,16 @@ describe("tool.move", () => {
         await expect(
           move.execute({ source: "dir", destination: path.join("alias", "inner") }, testCtx),
         ).rejects.toThrow("Source and destination overlap:")
+        // Two hard links are two names for one entry rather than two entries, and renaming between them
+        // succeeds as a no-op that would leave the source standing while this call reported a relocation. The
+        // pair is refused on the identity of the entry itself, which is what tells them apart from two paths
+        // that merely hold the same bytes.
+        await fs.link(path.join(tmp.path, "a.txt"), path.join(tmp.path, "hard.txt"))
+        await expect(
+          move.execute({ source: "a.txt", destination: "hard.txt", overwrite: true }, testCtx),
+        ).rejects.toThrow("Source and destination are the same path:")
+        expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
+        expect(await Bun.file(path.join(tmp.path, "hard.txt")).text()).toBe("hello world")
         // Every refusal came before consent, and the project is exactly as it was seeded.
         expect(requests).toEqual([])
         expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("hello world")
@@ -433,7 +479,7 @@ describe("tool.move", () => {
         ).rejects.toThrow("Path resolution changed while permission was pending:")
         expect(await Bun.file(path.join(tmp.path, "dir", "inner", "keep.txt")).text()).toBe("kept content")
         expect(await Bun.file(path.join(tmp.path, "moved.txt")).exists()).toBe(false)
-        expect((await fs.readdir(tmp.path)).sort()).toEqual([".git", "a.txt", "alias", "dir", "other"])
+        expect((await fs.readdir(tmp.path)).sort()).toEqual([".git", "a.txt", "alias", "dir", "hard.txt", "other"])
       },
     })
   })
@@ -528,6 +574,27 @@ describe("tool.move", () => {
         expect([left, right].filter((names) => names.includes("moved.txt"))).toHaveLength(1)
         expect([left, right].filter((names) => names.includes("stale.txt"))).toHaveLength(1)
         expect((await fs.readdir(tmp.path)).filter((name) => name.includes("opencode-move"))).toEqual([])
+        // The same contention onto free destinations, where each call holds its destination with an empty
+        // directory of its own before relocating, because that is the only entry a rename of a directory can
+        // replace. The call that loses takes that reservation back down, so no empty directory is left
+        // standing where nothing ever landed.
+        await Bun.write(path.join(tmp.path, "tree", "leaf.txt"), "leaf content")
+        const fresh = await Promise.all([
+          move.execute({ source: "tree", destination: "first" }, ctx).then(
+            () => "moved",
+            (err: Error) => err.message,
+          ),
+          move.execute({ source: "tree", destination: "second" }, ctx).then(
+            () => "moved",
+            (err: Error) => err.message,
+          ),
+        ])
+        expect(fresh.filter((outcome) => outcome === "moved")).toHaveLength(1)
+        expect(fresh.find((outcome) => outcome !== "moved")).toContain("File or directory not found:")
+        const landed = (await fs.readdir(tmp.path)).filter((name) => name === "first" || name === "second")
+        expect(landed).toHaveLength(1)
+        expect(await Bun.file(path.join(tmp.path, landed[0]!, "leaf.txt")).text()).toBe("leaf content")
+        expect((await fs.readdir(tmp.path)).filter((name) => name.includes("opencode-move"))).toEqual([])
       },
     })
   })
@@ -547,9 +614,11 @@ describe("tool.move", () => {
           events.push(`${event.properties.event}:${event.properties.file}`)
         })
         const move = await MoveTool.init()
-        // Every publication is awaited and Bus.publish awaits its subscribers, so the three events have
-        // already arrived by the time execute resolves and no wait is needed here.
         const result = await move.execute({ source: "a.txt", destination: "b.txt" }, ctx)
+        // Every publication is awaited and Bus.publish awaits its subscribers, so the three events have
+        // already arrived by the time execute resolves. The wait follows the bus test idiom of this repository
+        // and is belt and braces rather than something the assertions below depend on.
+        await new Promise((resolve) => setTimeout(resolve, 100))
         unsub()
         unwatch()
         // The expectations come from the fixture rather than from the result, so the payloads are proven
