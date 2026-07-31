@@ -20,6 +20,13 @@ export const MoveTool = Tool.define("move", {
     overwrite: z.boolean().optional().describe("Replace the destination if it already exists (defaults to false)"),
   }),
   async execute(params, ctx) {
+    // One named entry moves per call, so the two characters the permission matcher treats as wildcards belong
+    // in neither path. Refusing them before the boundary guard also keeps a caller from smuggling one into the
+    // `<parent>/*` glob that guard stores on an "always" reply, where it would widen the approval to every
+    // sibling directory the pattern happens to match.
+    if (/[*?]/.test(params.source)) throw new Error(`Source must not contain * or ?: ${params.source}`)
+    if (/[*?]/.test(params.destination)) throw new Error(`Destination must not contain * or ?: ${params.destination}`)
+
     // Resolved with the write tool's rule, then normalized, so `a/./b`, `a/x/../b` and `b/` cannot name one
     // entry while comparing, locking and rendering as two. Only a relative input is joined, and only an
     // already absolute result is normalized.
@@ -38,10 +45,12 @@ export const MoveTool = Tool.define("move", {
     // all.
     if (source === destination) throw new Error(`Source and destination are the same path: ${source}`)
     // `.`, a bare separator and the project path spelled out in full all resolve to the root, which is not a
-    // relocatable entry: an authorized overwrite would recursively remove the whole project.
-    if (source === Instance.directory || source === Instance.worktree)
+    // relocatable entry: an authorized overwrite would recursively remove the whole project. Both project
+    // paths are resolved as well, because a directory handed over as `/project/` or `/project/.` compares
+    // unequal to the very root it names, and a non-git project has no worktree to catch that for it.
+    if (source === path.resolve(Instance.directory) || source === path.resolve(Instance.worktree))
       throw new Error(`Source must not be the project root: ${source}`)
-    if (destination === Instance.directory || destination === Instance.worktree)
+    if (destination === path.resolve(Instance.directory) || destination === path.resolve(Instance.worktree))
       throw new Error(`Destination must not be the project root: ${destination}`)
     // Nesting either way is refused before consent, because clearing an overlapping destination would delete
     // the source, or part of its subtree, before the rename could ever run.
